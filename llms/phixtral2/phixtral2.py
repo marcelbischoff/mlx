@@ -12,12 +12,6 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_unflatten
 from transformers import AutoTokenizer
 
-def moe_factory() -> dict:
-    return {
-        "num_experts": 4,
-        "num_experts_per_tok": 2,
-    }
-
 @dataclass
 class ModelArgs:
     max_sequence_length: int = 2048
@@ -26,7 +20,8 @@ class ModelArgs:
     num_heads: int = 32
     num_layers: int = 32
     rotary_dim: int = 32
-    moe: dict = field(default_factory=moe_factory) 
+    num_experts_per_tok: int = 2
+    num_local_experts:  int = 4
 
     @classmethod
     def from_dict(cls, params):
@@ -37,7 +32,6 @@ class ModelArgs:
                 if k in inspect.signature(cls).parameters
             }
         )
-
 
 class LayerNorm(nn.LayerNorm):
     def __call__(self, x: mx.array) -> mx.array:
@@ -108,8 +102,8 @@ class MOE(nn.Module):
         super().__init__()
         self.dim = dim
         self.hidden_dim = hidden_dim
-        self.num_experts = args.moe["num_experts"]
-        self.num_experts_per_tok = args.moe["num_experts_per_tok"]
+        self.num_experts = args.num_local_experts
+        self.num_experts_per_tok = args.num_experts_per_tok
         self.mlp = [MLP(self.dim, self.hidden_dim) for _ in range(self.num_experts)]
         self.gate = nn.Linear(args.model_dim, self.num_experts, bias=False)
 
@@ -119,7 +113,11 @@ class MOE(nn.Module):
         x = x.reshape(-1, x.shape[-1])
 
         gates = self.gate(x)
-        inds = mx.argpartition(-gates, kth=ne, axis=-1)[:, :ne]
+        if ne < self.num_experts:
+            inds = mx.argpartition(-gates, kth=ne, axis=-1)[:, :ne]
+        else:
+            inds = mx.broadcast_to(mx.arange(ne), gates.shape)
+
         scores = mx.softmax(
             mx.take_along_axis(gates, inds, axis=-1).astype(mx.float32),
             axis=-1,
@@ -271,7 +269,6 @@ if __name__ == "__main__":
                 allow_patterns=["*.json", "*.safetensors", "tokenizer.model"],
             )
         )
-    print(f"{model_path=}")
 
     with open(model_path / "config.json", "r") as f:
         config = json.loads(f.read())
